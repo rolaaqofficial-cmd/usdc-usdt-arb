@@ -89,7 +89,7 @@ async function executeTrade(loanAmount) {
 
 async function scan() {
   try {
-    const loanAmount = ethers.parseUnits("10000", 6);
+    const loanAmount = ethers.parseUnits("50000", 6);
     const prices = await checkPrices(loanAmount);
     if (!prices) return;
     const p = calculateProfit(loanAmount, prices.backward);
