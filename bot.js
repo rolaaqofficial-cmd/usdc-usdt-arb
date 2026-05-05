@@ -38,7 +38,7 @@ let stats = {
   logs:          [],
   botStarted:    new Date().toISOString(),
   walletAddress: wallet.address,
-  contractAddress: CONTRACT_ADDRESS,
+  contractAddress: CONTRACT_ADDRESS = 0x062350fF34839f593Cd58658a4ff1ea16f0251Ae
 };
 
 function log(msg) {
