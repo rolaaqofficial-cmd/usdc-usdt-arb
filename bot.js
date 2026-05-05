@@ -273,5 +273,5 @@ app.listen(PORT, () => {
   log("💼 Wallet: " + wallet.address);
 });
 
-setInterval(scan, 1000);
+setInterval(scan, 3000);
 scan();
