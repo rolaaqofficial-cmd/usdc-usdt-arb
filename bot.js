@@ -12,13 +12,9 @@ const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
 
-const ADDRESSES = {
-  USDC:       "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
-  USDCe:      "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-  USDT:       "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
-  AAVE_POOL:  "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
-  CURVE_POOL: "0x445FE580eF8d70FF569aB36e80c647af338db351",
-};
+const CURVE_POOL = "0x445FE580eF8d70FF569aB36e80c647af338db351";
+const USDC       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const USDT       = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
 
 const CURVE_ABI = [
   "function get_dy_underlying(int128 i, int128 j, uint256 dx) view returns (uint256)",
@@ -28,30 +24,25 @@ const CONTRACT_ABI = [
   "function startArbitrage(uint256 amount) external",
 ];
 
-let stats = {
-  totalTrades:   0,
-  totalProfit:   0,
-  forward:       "0",
-  backward:      "0",
-  gap:           "0",
-  status:        "Starting...",
-  logs:          [],
-  botStarted:    new Date().toISOString(),
-  walletAddress: wallet.address,
-  contractAddress: CONTRACT_ADDRESS = 0x062350fF34839f593Cd58658a4ff1ea16f0251Ae
-};
+let totalTrades  = 0;
+let totalProfit  = 0;
+let currentGap   = "0";
+let currentBack  = "0";
+let botStatus    = "Starting...";
+let logs         = [];
+const botStarted = new Date().toISOString();
 
 function log(msg) {
   const time = new Date().toLocaleTimeString();
   const line = `[${time}] ${msg}`;
   console.log(line);
-  stats.logs.unshift(line);
-  if (stats.logs.length > 100) stats.logs.pop();
+  logs.unshift(line);
+  if (logs.length > 100) logs.pop();
 }
 
 async function checkPrices(loanAmount) {
   try {
-    const curve = new ethers.Contract(ADDRESSES.CURVE_POOL, CURVE_ABI, provider);
+    const curve = new ethers.Contract(CURVE_POOL, CURVE_ABI, provider);
     const forward  = await curve.get_dy_underlying(1, 2, loanAmount);
     const backward = await curve.get_dy_underlying(2, 1, forward);
     return { forward, backward };
@@ -64,37 +55,32 @@ async function checkPrices(loanAmount) {
 function calculateProfit(loanAmount, backward) {
   const loan     = Number(loanAmount) / 1e6;
   const returned = Number(backward)   / 1e6;
-  const aaveFee   = loan * 0.0009;
-  const curveFee1 = loan * 0.0001;
-  const curveFee2 = loan * 0.0001;
-  const gasFee    = 0.05;
-  const totalFees   = aaveFee + curveFee1 + curveFee2 + gasFee;
-  const grossProfit = returned - loan;
-  const netProfit   = grossProfit - totalFees;
+  const fees     = (loan * 0.0009) + (loan * 0.0001) + (loan * 0.0001) + 0.05;
+  const gross    = returned - loan;
+  const net      = gross - fees;
   return {
     loan:       loan.toFixed(2),
     returned:   returned.toFixed(4),
-    gross:      grossProfit.toFixed(4),
-    fees:       totalFees.toFixed(4),
-    net:        netProfit.toFixed(4),
-    profitable: netProfit >= MIN_PROFIT,
+    gross:      gross.toFixed(4),
+    fees:       fees.toFixed(4),
+    net:        net.toFixed(4),
+    profitable: net >= MIN_PROFIT,
   };
 }
 
 async function executeTrade(loanAmount) {
   try {
-    log("🚀 Executing flash loan trade...");
+    log("Executing trade...");
     const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
     const tx = await contract.startArbitrage(loanAmount, { gasLimit: 500000 });
-    log("TX sent: " + tx.hash);
+    log("TX: " + tx.hash);
     const receipt = await tx.wait();
     if(receipt.status === 1) {
       log("✅ Trade SUCCESS!");
       return true;
-    } else {
-      log("❌ Trade FAILED");
-      return false;
     }
+    log("❌ Trade failed");
+    return false;
   } catch(e) {
     log("Trade error: " + e.message);
     return false;
@@ -106,87 +92,71 @@ async function scan() {
     const loanAmount = ethers.parseUnits("10000", 6);
     const prices = await checkPrices(loanAmount);
     if (!prices) return;
-
     const p = calculateProfit(loanAmount, prices.backward);
-    stats.forward  = p.loan;
-    stats.backward = p.returned;
-    stats.gap      = p.gross;
-
+    currentGap  = p.gross;
+    currentBack = p.returned;
     log(`Scan | Loan:$${p.loan} Back:$${p.returned} Net:$${p.net}`);
-
     if (p.profitable) {
-      stats.status = `🚀 EXECUTING! Net: $${p.net}`;
-      const success = await executeTrade(loanAmount);
-      if(success) {
-        stats.totalTrades++;
-        stats.totalProfit += parseFloat(p.net);
-        stats.status = `✅ Profit: $${p.net}`;
+      botStatus = `EXECUTING! Net: $${p.net}`;
+      const ok = await executeTrade(loanAmount);
+      if(ok) {
+        totalTrades++;
+        totalProfit += parseFloat(p.net);
+        botStatus = `✅ Profit: $${p.net}`;
       }
     } else {
-      stats.status = `⏸ Waiting | Gap: $${p.gross} | Need: $${MIN_PROFIT}`;
+      botStatus = `Waiting | Gap: $${p.gross} | Need: $${MIN_PROFIT}`;
     }
   } catch(e) {
-    log("Scan error: " + e.message);
+    log("Error: " + e.message);
   }
 }
 
 app.get("/", (req, res) => {
-  const uptime = Math.floor((Date.now() - new Date(stats.botStarted).getTime()) / 1000);
-  const hours  = Math.floor(uptime / 3600);
-  const mins   = Math.floor((uptime % 3600) / 60);
-  const secs   = uptime % 60;
-  res.send(`
-<!DOCTYPE html>
+  const up = Math.floor((Date.now() - new Date(botStarted).getTime()) / 1000);
+  res.send(`<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>USDC/USDT Arb Bot</title>
-  <meta http-equiv="refresh" content="2">
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#050505;color:#00ff88;font-family:monospace;padding:16px}
-    h1{text-align:center;font-size:20px;margin-bottom:16px}
-    .status{background:#111;border:1px solid #00ff8844;border-radius:8px;padding:12px;margin-bottom:16px;text-align:center;font-size:14px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
-    .card{background:#111;border:1px solid #00ff8822;border-radius:8px;padding:12px}
-    .card h3{color:#555;font-size:10px;margin-bottom:6px}
-    .card .val{font-size:18px;font-weight:bold}
-    .wallet{background:#111;border:1px solid #00ff8822;border-radius:8px;padding:10px;margin-bottom:16px;font-size:10px;color:#555;word-break:break-all}
-    .logs{background:#111;border:1px solid #00ff8822;border-radius:8px;padding:12px;max-height:300px;overflow-y:auto}
-    .log{font-size:11px;color:#777;padding:3px 0;border-bottom:1px solid #1a1a1a}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARB BOT</title>
+<meta http-equiv="refresh" content="2">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050505;color:#00ff88;font-family:monospace;padding:16px}
+h1{text-align:center;font-size:18px;margin-bottom:12px}
+.s{background:#111;border:1px solid #00ff8844;border-radius:8px;padding:12px;margin-bottom:12px;text-align:center}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+.c{background:#111;border:1px solid #00ff8822;border-radius:8px;padding:10px}
+.c h3{color:#555;font-size:10px;margin-bottom:4px}
+.c .v{font-size:18px;font-weight:bold}
+.l{background:#111;border:1px solid #00ff8822;border-radius:8px;padding:10px;max-height:250px;overflow-y:auto}
+.li{font-size:11px;color:#777;padding:2px 0;border-bottom:1px solid #1a1a1a}
+</style>
 </head>
 <body>
-  <h1>🤖 USDC/USDT ARB BOT</h1>
-  <div class="status">${stats.status}</div>
-  <div class="grid">
-    <div class="card"><h3>TOTAL PROFIT</h3><div class="val">$${stats.totalProfit.toFixed(2)}</div></div>
-    <div class="card"><h3>TOTAL TRADES</h3><div class="val">${stats.totalTrades}</div></div>
-    <div class="card"><h3>LOAN</h3><div class="val">$${stats.forward}</div></div>
-    <div class="card"><h3>RETURNED</h3><div class="val">$${stats.backward}</div></div>
-    <div class="card"><h3>GAP</h3><div class="val">$${stats.gap}</div></div>
-    <div class="card"><h3>MIN PROFIT</h3><div class="val">$${MIN_PROFIT}</div></div>
-    <div class="card"><h3>UPTIME</h3><div class="val">${hours}h ${mins}m ${secs}s</div></div>
-    <div class="card"><h3>NETWORK</h3><div class="val" style="font-size:13px">Polygon</div></div>
-  </div>
-  <div class="wallet">
-    💼 ${stats.walletAddress}<br>
-    📝 Contract: ${stats.contractAddress}
-  </div>
-  <div class="logs">
-    ${stats.logs.map(l => `<div class="log">${l}</div>`).join("")}
-  </div>
+<h1>🤖 USDC/USDT ARB BOT</h1>
+<div class="s">${botStatus}</div>
+<div class="g">
+<div class="c"><h3>PROFIT</h3><div class="v">$${totalProfit.toFixed(2)}</div></div>
+<div class="c"><h3>TRADES</h3><div class="v">${totalTrades}</div></div>
+<div class="c"><h3>LOAN</h3><div class="v">$10,000</div></div>
+<div class="c"><h3>BACK</h3><div class="v">$${currentBack}</div></div>
+<div class="c"><h3>GAP</h3><div class="v">$${currentGap}</div></div>
+<div class="c"><h3>MIN</h3><div class="v">$${MIN_PROFIT}</div></div>
+<div class="c"><h3>UPTIME</h3><div class="v">${Math.floor(up/3600)}h${Math.floor((up%3600)/60)}m</div></div>
+<div class="c"><h3>NET</h3><div class="v">Polygon</div></div>
+</div>
+<div class="l">${logs.map(l=>`<div class="li">${l}</div>`).join("")}</div>
 </body>
-</html>
-  `);
+</html>`);
 });
 
 app.listen(PORT, () => {
-  log("🚀 Bot started!");
-  log("💼 Wallet: " + wallet.address);
-  log("📝 Contract: " + CONTRACT_ADDRESS);
-  log("🎯 Min profit: $" + MIN_PROFIT);
+  log("Bot started!");
+  log("Wallet: " + wallet.address);
+  log("Contract: " + CONTRACT_ADDRESS);
+  log("Min profit: $" + MIN_PROFIT);
 });
 
 setInterval(scan, 2000);
