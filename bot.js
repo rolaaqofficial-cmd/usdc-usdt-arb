@@ -14,7 +14,6 @@ const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
 const WETH = "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619";
 const USDT = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
 
-// Loan sizes to try — bot khud best dhundega
 const LOAN_SIZES = [
   ethers.parseUnits("50000", 6),
   ethers.parseUnits("30000", 6),
@@ -24,27 +23,26 @@ const LOAN_SIZES = [
 ];
 
 const UNIV3_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
-
 const QUOTER_ABI = [
   "function quoteExactInputSingle(address,address,uint24,uint256,uint160) external returns (uint256)"
 ];
 
-// Uniswap V3 Router
-const ROUTER_UNI = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
-const ROUTER_ABI = [
-  "function exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160)) external returns (uint256)"
+const QUICK_FACTORY = "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32";
+const FACTORY_ABI = ["function getPair(address,address) external view returns (address)"];
+const PAIR_ABI = [
+  "function getReserves() external view returns (uint112,uint112,uint32)",
+  "function token0() external view returns (address)"
 ];
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
-const CONTRACT_ABI = [
-  "function startArbitrage(uint256 amount, bool buyOnUniswap) external"
-];
+const CONTRACT_ABI = ["function startArbitrage(uint256 amount, bool buyOnUniswap) external"];
 
-let totalTrades = 0;
-let totalProfit = 0;
-let botStatus   = "Starting...";
-let logs        = [];
-let scanCount   = 0;
+let totalTrades  = 0;
+let totalProfit  = 0;
+let botStatus    = "Starting...";
+let logs         = [];
+let scanCount    = 0;
+let pairAddress  = null;
 const botStarted = new Date().toISOString();
 
 function log(msg) {
@@ -55,69 +53,106 @@ function log(msg) {
   if (logs.length > 150) logs.pop();
 }
 
-async function getQuote(tokenIn, tokenOut, fee, amountIn) {
+// Uniswap V3 quote
+async function uniQuote(tokenIn, tokenOut, fee, amountIn) {
   try {
     const q = new ethers.Contract(UNIV3_QUOTER, QUOTER_ABI, provider);
-    const out = await q.quoteExactInputSingle.staticCall(
-      tokenIn, tokenOut, fee, amountIn, 0
-    );
+    const out = await q.quoteExactInputSingle.staticCall(tokenIn, tokenOut, fee, amountIn, 0);
     return BigInt(out);
+  } catch(e) { return null; }
+}
+
+// QuickSwap V2 price using reserves
+async function quickAmountOut(amountIn, reserveIn, reserveOut) {
+  const amountInWithFee = BigInt(amountIn) * 997n;
+  const numerator = amountInWithFee * BigInt(reserveOut);
+  const denominator = BigInt(reserveIn) * 1000n + amountInWithFee;
+  return numerator / denominator;
+}
+
+async function getQuickReserves() {
+  try {
+    if (!pairAddress) {
+      const factory = new ethers.Contract(QUICK_FACTORY, FACTORY_ABI, provider);
+      pairAddress = await factory.getPair(WETH, USDT);
+      log("QuickSwap pair: " + pairAddress);
+    }
+    const pair = new ethers.Contract(pairAddress, PAIR_ABI, provider);
+    const [r0, r1] = await pair.getReserves();
+    const token0 = await pair.token0();
+    const isWethToken0 = token0.toLowerCase() === WETH.toLowerCase();
+    return {
+      reserveWeth: isWethToken0 ? r0 : r1,
+      reserveUsdt: isWethToken0 ? r1 : r0,
+    };
   } catch(e) {
+    log("QuickSwap reserves error: " + e.message);
     return null;
   }
 }
 
-async function checkOpportunity(loanAmount) {
+async function checkAllOpportunities(loanAmount) {
   try {
     const loanNum = Number(loanAmount) / 1e6;
+    const reserves = await getQuickReserves();
+    if (!reserves) return null;
 
-    // Buy WETH on Uniswap 0.05%, Sell on Uniswap 0.3%
-    const wethOut1   = await getQuote(USDT, WETH, 500,  loanAmount);
-    const usdtBack1  = wethOut1 ? await getQuote(WETH, USDT, 3000, wethOut1) : null;
-    const profit1    = usdtBack1 ? (Number(usdtBack1) / 1e6) - loanNum : -9999;
+    const { reserveWeth, reserveUsdt } = reserves;
 
-    // Buy WETH on Uniswap 0.3%, Sell on Uniswap 0.05%
-    const wethOut2   = await getQuote(USDT, WETH, 3000, loanAmount);
-    const usdtBack2  = wethOut2 ? await getQuote(WETH, USDT, 500,  wethOut2) : null;
-    const profit2    = usdtBack2 ? (Number(usdtBack2) / 1e6) - loanNum : -9999;
+    // === Direction 1: Buy on Uniswap V3, Sell on QuickSwap ===
+    const wethFromUni = await uniQuote(USDT, WETH, 500, loanAmount);
+    let profit1 = -9999;
+    if (wethFromUni) {
+      const usdtBackQuick = await quickAmountOut(wethFromUni, reserveWeth, reserveUsdt);
+      profit1 = (Number(usdtBackQuick) / 1e6) - loanNum;
+    }
 
+    // === Direction 2: Buy on QuickSwap, Sell on Uniswap V3 ===
+    const wethFromQuick = await quickAmountOut(loanAmount, reserveUsdt, reserveWeth);
+    let profit2 = -9999;
+    if (wethFromQuick) {
+      const usdtBackUni = await uniQuote(WETH, USDT, 500, wethFromQuick);
+      if (usdtBackUni) {
+        profit2 = (Number(usdtBackUni) / 1e6) - loanNum;
+      }
+    }
+
+    // === Pick best direction ===
     const bestProfit = Math.max(profit1, profit2);
     const buyOnUni   = profit1 >= profit2;
 
-    // Slippage check — agar profit margin kam hai skip karo
-    const profitPct = (bestProfit / loanNum) * 100;
-    if (profitPct < 0.025) return { profit: bestProfit, profitable: false, loanNum, profitPct };
-
     return {
-      profit:      bestProfit,
-      profitable:  bestProfit >= MIN_PROFIT,
-      buyOnUni:    buyOnUni,
-      loanNum:     loanNum,
-      profitPct:   profitPct,
-      direction:   buyOnUni ? "Uni 0.05% → Uni 0.3%" : "Uni 0.3% → Uni 0.05%"
+      profit:     bestProfit,
+      profitable: bestProfit >= MIN_PROFIT,
+      buyOnUni:   buyOnUni,
+      loanNum:    loanNum,
+      loan:       loanAmount,
+      direction:  buyOnUni ? "UniV3→QuickSwap" : "QuickSwap→UniV3",
+      profit1:    profit1,
+      profit2:    profit2,
     };
 
   } catch(e) {
-    log("Check error: " + e.message);
+    log("Opportunity error: " + e.message);
     return null;
   }
 }
 
 async function findBestOpportunity() {
-  let bestOpp = null;
+  let bestOpp    = null;
   let bestProfit = -9999;
 
   for (const loan of LOAN_SIZES) {
-    const opp = await checkOpportunity(loan);
+    const opp = await checkAllOpportunities(loan);
     if (!opp) continue;
 
     if (opp.profit > bestProfit) {
       bestProfit = opp.profit;
-      bestOpp = { ...opp, loan };
+      bestOpp    = opp;
     }
 
-    // Agar bada loan acha profit de raha hai to chhota try na karo
-    if (opp.profitable && opp.profitPct > 0.05) break;
+    // Agar profitable mila to aur try karne ki zaroorat nahi
+    if (opp.profitable) break;
   }
 
   return bestOpp;
@@ -125,14 +160,13 @@ async function findBestOpportunity() {
 
 async function executeTrade(loan, buyOnUni) {
   try {
-    log("🚀 Executing flash loan $" + (Number(loan)/1e6).toFixed(0) + "...");
+    log("🚀 Executing $" + (Number(loan)/1e6).toFixed(0) + "...");
     const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
     const fee = await provider.getFeeData();
 
-    // 3x priority fee — MEV bots se aage!
     const tx = await contract.startArbitrage(loan, buyOnUni, {
       gasLimit: 900000,
-      maxFeePerGas: fee.maxFeePerGas * 2n,
+      maxFeePerGas:         fee.maxFeePerGas * 2n,
       maxPriorityFeePerGas: fee.maxPriorityFeePerGas * 3n,
     });
 
@@ -158,27 +192,25 @@ async function scan() {
     const opp = await findBestOpportunity();
     if (!opp) return;
 
-    const loanStr = "$" + opp.loanNum.toFixed(0);
-
     if (scanCount % 3 === 0) {
-      log(`#${scanCount} | ${opp.direction} | Loan:${loanStr} | $${opp.profit.toFixed(4)} | ${opp.profitPct?.toFixed(4)}%`);
+      log(`#${scanCount} | ${opp.direction} | $${opp.loanNum.toFixed(0)} | D1:$${opp.profit1.toFixed(2)} D2:$${opp.profit2.toFixed(2)} | Best:$${opp.profit.toFixed(4)}`);
     }
 
     if (opp.profitable) {
-      log(`💰 PROFIT $${opp.profit.toFixed(2)} on ${loanStr} loan!`);
-      botStatus = `🚀 EXECUTING! ${loanStr} | $${opp.profit.toFixed(2)}`;
+      log(`💰 PROFIT $${opp.profit.toFixed(2)}! Loan:$${opp.loanNum} Dir:${opp.direction}`);
+      botStatus = `🚀 EXECUTING! ${opp.direction} | $${opp.profit.toFixed(2)}`;
 
       const ok = await executeTrade(opp.loan, opp.buyOnUni);
       if (ok) {
         totalTrades++;
         totalProfit += opp.profit;
-        botStatus = `✅ Trade #${totalTrades} | $${opp.profit.toFixed(2)} | Total: $${totalProfit.toFixed(2)}`;
-        log(`🏆 Total: $${totalProfit.toFixed(2)} | Trades: ${totalTrades}`);
+        botStatus = `✅ Trade #${totalTrades} | $${opp.profit.toFixed(2)} | Total:$${totalProfit.toFixed(2)}`;
+        log(`🏆 Total:$${totalProfit.toFixed(2)} | Trades:${totalTrades}`);
       } else {
         botStatus = `❌ Failed — scanning...`;
       }
     } else {
-      botStatus = `⏸ Best: ${opp.direction} | ${loanStr} | $${opp.profit.toFixed(4)} | Need $${MIN_PROFIT}`;
+      botStatus = `⏸ ${opp.direction} | $${opp.loanNum.toFixed(0)} | D1:$${opp.profit1.toFixed(2)} D2:$${opp.profit2.toFixed(2)} | Need $${MIN_PROFIT}`;
     }
 
   } catch(e) {
@@ -235,7 +267,8 @@ app.listen(PORT, () => {
   log("📍 Polygon Mainnet");
   log("💰 Smart loan: $5k-$50k auto");
   log("🎯 Min profit: $" + MIN_PROFIT);
-  log("⚡ MEV Protection: 3x Priority Gas");
+  log("⚡ MEV: 3x Priority Gas");
+  log("🔄 Both directions checked!");
   log("📝 Contract: " + CONTRACT_ADDRESS);
   log("💼 Wallet: " + wallet.address);
 });
