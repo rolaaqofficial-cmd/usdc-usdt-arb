@@ -1,10 +1,8 @@
 {
   "name": "usdc-usdt-arb-bot",
   "version": "1.0.0",
-  "description": "USDC/USDT Flash Loan Arbitrage Bot - Polygon + Curve",
-  "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node deploy.js && node bot.js"
   },
   "dependencies": {
     "ethers": "^6.9.0",
