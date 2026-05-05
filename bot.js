@@ -20,9 +20,8 @@ const QUOTER_ABI = [
 ];
 
 const DEXES = [
-  { name: "Uniswap V3 0.05%", quoter: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", fee: 500 },
-  { name: "Uniswap V3 0.3%",  quoter: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", fee: 3000 },
-  { name: "QuickSwap V3",     quoter: "0xa15F0D7377B2A0C0c10db057f641beD21028FC89", fee: 500 },
+  { name: "Uniswap V3", quoter: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", fee: 500 },
+  { name: "QuickSwap V3", quoter: "0xa15F0D7377B2A0C0c10db057f641beD21028FC89", fee: 500 },
 ];
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
@@ -59,44 +58,42 @@ async function getQuote(quoter, tokenIn, tokenOut, fee, amountIn) {
 
 async function checkOpportunity() {
   try {
-    let bestProfit = -999;
-    let bestOpp = null;
+    const uniQuoter   = DEXES[0].quoter;
+    const quickQuoter = DEXES[1].quoter;
 
-    for (let i = 0; i < DEXES.length; i++) {
-      for (let j = 0; j < DEXES.length; j++) {
-        if (i === j) continue;
+    // Option 1: Buy on Uniswap, Sell on QuickSwap
+    const wethFromUni    = await getQuote(uniQuoter,   USDT, WETH, 500, LOAN);
+    const usdtBackQuick  = wethFromUni 
+      ? await getQuote(quickQuoter, WETH, USDT, 500, wethFromUni) 
+      : null;
+    const profit1 = usdtBackQuick 
+      ? (Number(usdtBackQuick) / 1e6) - (Number(LOAN) / 1e6) 
+      : -999;
 
-        const buyDex  = DEXES[i];
-        const sellDex = DEXES[j];
+    // Option 2: Buy on QuickSwap, Sell on Uniswap
+    const wethFromQuick  = await getQuote(quickQuoter, USDT, WETH, 500, LOAN);
+    const usdtBackUni    = wethFromQuick 
+      ? await getQuote(uniQuoter,   WETH, USDT, 500, wethFromQuick) 
+      : null;
+    const profit2 = usdtBackUni 
+      ? (Number(usdtBackUni) / 1e6) - (Number(LOAN) / 1e6) 
+      : -999;
 
-        const wethOut = await getQuote(
-          buyDex.quoter, USDT, WETH, buyDex.fee, LOAN
-        );
-        if (!wethOut) continue;
-
-        const usdtBack = await getQuote(
-          sellDex.quoter, WETH, USDT, sellDex.fee, wethOut
-        );
-        if (!usdtBack) continue;
-
-        const loanNum  = Number(LOAN) / 1e6;
-        const backNum  = Number(usdtBack) / 1e6;
-        const profit   = backNum - loanNum;
-
-        if (profit > bestProfit) {
-          bestProfit = profit;
-          bestOpp = {
-            buyDex:  buyDex.name,
-            sellDex: sellDex.name,
-            profit:  profit,
-            profitable: profit >= MIN_PROFIT,
-            buyOnUniswap: i === 0 || i === 1,
-          };
-        }
-      }
+    if (profit1 >= profit2) {
+      return {
+        direction: "Uniswap → QuickSwap",
+        profit: profit1,
+        profitable: profit1 >= MIN_PROFIT,
+        buyOnUniswap: true,
+      };
+    } else {
+      return {
+        direction: "QuickSwap → Uniswap",
+        profit: profit2,
+        profitable: profit2 >= MIN_PROFIT,
+        buyOnUniswap: false,
+      };
     }
-
-    return bestOpp;
 
   } catch(e) {
     log("Check error: " + e.message);
@@ -108,8 +105,6 @@ async function executeTrade(buyOnUniswap) {
   try {
     log("🚀 Executing...");
     const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
-
-    // High priority gas — MEV se aage rahenge!
     const fee = await provider.getFeeData();
     const priorityFee = fee.maxPriorityFeePerGas * 3n;
     const maxFee = fee.maxFeePerGas * 2n;
@@ -143,23 +138,24 @@ async function scan() {
     if (!opp) return;
 
     if (scanCount % 3 === 0) {
-      log(`#${scanCount} | Buy:${opp.buyDex} Sell:${opp.sellDex} | $${opp.profit.toFixed(4)}`);
+      log(`#${scanCount} | ${opp.direction} | $${opp.profit.toFixed(4)}`);
     }
 
     if (opp.profitable) {
       log(`💰 PROFIT $${opp.profit.toFixed(4)}! Executing...`);
-      botStatus = `🚀 EXECUTING! $${opp.profit.toFixed(2)}`;
+      botStatus = `🚀 EXECUTING! ${opp.direction} | $${opp.profit.toFixed(2)}`;
 
       const ok = await executeTrade(opp.buyOnUniswap);
       if (ok) {
         totalTrades++;
         totalProfit += opp.profit;
         botStatus = `✅ Trade #${totalTrades} | $${opp.profit.toFixed(2)} | Total: $${totalProfit.toFixed(2)}`;
+        log(`🏆 Total: $${totalProfit.toFixed(2)} | Trades: ${totalTrades}`);
       } else {
         botStatus = `❌ Failed — scanning...`;
       }
     } else {
-      botStatus = `⏸ Best: ${opp.buyDex}→${opp.sellDex} | $${opp.profit.toFixed(4)} | Need $${MIN_PROFIT}`;
+      botStatus = `⏸ Best: ${opp.direction} | $${opp.profit.toFixed(4)} | Need $${MIN_PROFIT}`;
     }
 
   } catch(e) {
