@@ -12,12 +12,15 @@ const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
 
-const CURVE_POOL = "0x445FE580eF8d70FF569aB36e80c647af338db351";
-const USDC       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-const USDT       = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+// Addresses
+const WETH  = "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619";
+const USDC  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
-const CURVE_ABI = [
-  "function get_dy_underlying(int128 i, int128 j, uint256 dx) view returns (uint256)",
+// Uniswap V3 Quoter
+const QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
+
+const QUOTER_ABI = [
+  "function quoteExactInputSingle(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96) external returns (uint256 amountOut)",
 ];
 
 const CONTRACT_ABI = [
@@ -42,27 +45,40 @@ function log(msg) {
 
 async function checkPrices(loanAmount) {
   try {
-    const curve = new ethers.Contract(CURVE_POOL, CURVE_ABI, provider);
-    const forward  = await curve.get_dy_underlying(1, 2, loanAmount);
-    const backward = await curve.get_dy_underlying(2, 1, forward);
-    return { forward, backward };
+    const quoter = new ethers.Contract(QUOTER, QUOTER_ABI, provider);
+
+    // USDC → WETH (Uniswap 0.05% pool)
+    const wethOut = await quoter.quoteExactInputSingle.staticCall(
+      USDC, WETH, 500, loanAmount, 0
+    );
+
+    // WETH → USDC (Uniswap 0.3% pool)
+    const usdcBack = await quoter.quoteExactInputSingle.staticCall(
+      WETH, USDC, 3000, wethOut, 0
+    );
+
+    return { wethOut, usdcBack };
   } catch(e) {
     log("Price error: " + e.message);
     return null;
   }
 }
 
-function calculateProfit(loanAmount, backward) {
+function calculateProfit(loanAmount, usdcBack) {
   const loan     = Number(loanAmount) / 1e6;
-  const returned = Number(backward)   / 1e6;
-  const fees     = (loan * 0.0009) + (loan * 0.0001) + (loan * 0.0001) + 0.05;
-  const gross    = returned - loan;
-  const net      = gross - fees;
+  const returned = Number(usdcBack)   / 1e6;
+  const aaveFee  = loan * 0.0009;
+  const fee1     = loan * 0.0005;
+  const fee2     = loan * 0.003;
+  const gasFee   = 0.05;
+  const totalFees   = aaveFee + fee1 + fee2 + gasFee;
+  const gross       = returned - loan;
+  const net         = gross - totalFees;
   return {
     loan:       loan.toFixed(2),
     returned:   returned.toFixed(4),
     gross:      gross.toFixed(4),
-    fees:       fees.toFixed(4),
+    fees:       totalFees.toFixed(4),
     net:        net.toFixed(4),
     profitable: net >= MIN_PROFIT,
   };
@@ -92,12 +108,12 @@ async function scan() {
     const loanAmount = ethers.parseUnits("50000", 6);
     const prices = await checkPrices(loanAmount);
     if (!prices) return;
-    const p = calculateProfit(loanAmount, prices.backward);
+    const p = calculateProfit(loanAmount, prices.usdcBack);
     currentGap  = p.gross;
     currentBack = p.returned;
     log(`Scan | Loan:$${p.loan} Back:$${p.returned} Net:$${p.net}`);
     if (p.profitable) {
-      botStatus = `EXECUTING! Net: $${p.net}`;
+      botStatus = `🚀 EXECUTING! Net: $${p.net}`;
       const ok = await executeTrade(loanAmount);
       if(ok) {
         totalTrades++;
@@ -119,7 +135,7 @@ app.get("/", (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ARB BOT</title>
+<title>WETH/USDC ARB BOT</title>
 <meta http-equiv="refresh" content="2">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -135,17 +151,17 @@ h1{text-align:center;font-size:18px;margin-bottom:12px}
 </style>
 </head>
 <body>
-<h1>🤖 USDC/USDT ARB BOT</h1>
+<h1>🤖 WETH/USDC ARB BOT</h1>
 <div class="s">${botStatus}</div>
 <div class="g">
 <div class="c"><h3>PROFIT</h3><div class="v">$${totalProfit.toFixed(2)}</div></div>
 <div class="c"><h3>TRADES</h3><div class="v">${totalTrades}</div></div>
-<div class="c"><h3>LOAN</h3><div class="v">$10,000</div></div>
+<div class="c"><h3>LOAN</h3><div class="v">$50,000</div></div>
 <div class="c"><h3>BACK</h3><div class="v">$${currentBack}</div></div>
 <div class="c"><h3>GAP</h3><div class="v">$${currentGap}</div></div>
 <div class="c"><h3>MIN</h3><div class="v">$${MIN_PROFIT}</div></div>
 <div class="c"><h3>UPTIME</h3><div class="v">${Math.floor(up/3600)}h${Math.floor((up%3600)/60)}m</div></div>
-<div class="c"><h3>NET</h3><div class="v">Polygon</div></div>
+<div class="c"><h3>PAIR</h3><div class="v" style="font-size:13px">WETH/USDC</div></div>
 </div>
 <div class="l">${logs.map(l=>`<div class="li">${l}</div>`).join("")}</div>
 </body>
@@ -153,7 +169,7 @@ h1{text-align:center;font-size:18px;margin-bottom:12px}
 });
 
 app.listen(PORT, () => {
-  log("Bot started!");
+  log("🚀 WETH/USDC Bot started!");
   log("Wallet: " + wallet.address);
   log("Contract: " + CONTRACT_ADDRESS);
   log("Min profit: $" + MIN_PROFIT);
