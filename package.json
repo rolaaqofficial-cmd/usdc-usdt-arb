@@ -2,7 +2,7 @@
   "name": "usdc-usdt-arb-bot",
   "version": "1.0.0",
   "scripts": {
-    "start": "node deploy.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "ethers": "^6.9.0",
