@@ -6,8 +6,7 @@ const PORT = process.env.PORT || 3000;
 
 const RPC_URL     = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const MIN_PROFIT  = parseFloat(process.env.MIN_PROFIT || "5");
-const LOAN        = ethers.parseUnits("20000", 6);
+const MIN_PROFIT  = 5;
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
@@ -15,13 +14,25 @@ const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
 const WETH = "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619";
 const USDT = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
 
+// Loan sizes to try — bot khud best dhundega
+const LOAN_SIZES = [
+  ethers.parseUnits("50000", 6),
+  ethers.parseUnits("30000", 6),
+  ethers.parseUnits("20000", 6),
+  ethers.parseUnits("10000", 6),
+  ethers.parseUnits("5000",  6),
+];
+
+const UNIV3_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
+
 const QUOTER_ABI = [
   "function quoteExactInputSingle(address,address,uint24,uint256,uint160) external returns (uint256)"
 ];
 
-const DEXES = [
-  { name: "Uniswap V3", quoter: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", fee: 500 },
-  { name: "QuickSwap V3", quoter: "0xa15F0D7377B2A0C0c10db057f641beD21028FC89", fee: 500 },
+// Uniswap V3 Router
+const ROUTER_UNI = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+const ROUTER_ABI = [
+  "function exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160)) external returns (uint256)"
 ];
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
@@ -44,9 +55,9 @@ function log(msg) {
   if (logs.length > 150) logs.pop();
 }
 
-async function getQuote(quoter, tokenIn, tokenOut, fee, amountIn) {
+async function getQuote(tokenIn, tokenOut, fee, amountIn) {
   try {
-    const q = new ethers.Contract(quoter, QUOTER_ABI, provider);
+    const q = new ethers.Contract(UNIV3_QUOTER, QUOTER_ABI, provider);
     const out = await q.quoteExactInputSingle.staticCall(
       tokenIn, tokenOut, fee, amountIn, 0
     );
@@ -56,44 +67,35 @@ async function getQuote(quoter, tokenIn, tokenOut, fee, amountIn) {
   }
 }
 
-async function checkOpportunity() {
+async function checkOpportunity(loanAmount) {
   try {
-    const uniQuoter   = DEXES[0].quoter;
-    const quickQuoter = DEXES[1].quoter;
+    const loanNum = Number(loanAmount) / 1e6;
 
-    // Option 1: Buy on Uniswap, Sell on QuickSwap
-    const wethFromUni    = await getQuote(uniQuoter,   USDT, WETH, 500, LOAN);
-    const usdtBackQuick  = wethFromUni 
-      ? await getQuote(quickQuoter, WETH, USDT, 500, wethFromUni) 
-      : null;
-    const profit1 = usdtBackQuick 
-      ? (Number(usdtBackQuick) / 1e6) - (Number(LOAN) / 1e6) 
-      : -999;
+    // Buy WETH on Uniswap 0.05%, Sell on Uniswap 0.3%
+    const wethOut1   = await getQuote(USDT, WETH, 500,  loanAmount);
+    const usdtBack1  = wethOut1 ? await getQuote(WETH, USDT, 3000, wethOut1) : null;
+    const profit1    = usdtBack1 ? (Number(usdtBack1) / 1e6) - loanNum : -9999;
 
-    // Option 2: Buy on QuickSwap, Sell on Uniswap
-    const wethFromQuick  = await getQuote(quickQuoter, USDT, WETH, 500, LOAN);
-    const usdtBackUni    = wethFromQuick 
-      ? await getQuote(uniQuoter,   WETH, USDT, 500, wethFromQuick) 
-      : null;
-    const profit2 = usdtBackUni 
-      ? (Number(usdtBackUni) / 1e6) - (Number(LOAN) / 1e6) 
-      : -999;
+    // Buy WETH on Uniswap 0.3%, Sell on Uniswap 0.05%
+    const wethOut2   = await getQuote(USDT, WETH, 3000, loanAmount);
+    const usdtBack2  = wethOut2 ? await getQuote(WETH, USDT, 500,  wethOut2) : null;
+    const profit2    = usdtBack2 ? (Number(usdtBack2) / 1e6) - loanNum : -9999;
 
-    if (profit1 >= profit2) {
-      return {
-        direction: "Uniswap → QuickSwap",
-        profit: profit1,
-        profitable: profit1 >= MIN_PROFIT,
-        buyOnUniswap: true,
-      };
-    } else {
-      return {
-        direction: "QuickSwap → Uniswap",
-        profit: profit2,
-        profitable: profit2 >= MIN_PROFIT,
-        buyOnUniswap: false,
-      };
-    }
+    const bestProfit = Math.max(profit1, profit2);
+    const buyOnUni   = profit1 >= profit2;
+
+    // Slippage check — agar profit margin kam hai skip karo
+    const profitPct = (bestProfit / loanNum) * 100;
+    if (profitPct < 0.025) return { profit: bestProfit, profitable: false, loanNum, profitPct };
+
+    return {
+      profit:      bestProfit,
+      profitable:  bestProfit >= MIN_PROFIT,
+      buyOnUni:    buyOnUni,
+      loanNum:     loanNum,
+      profitPct:   profitPct,
+      direction:   buyOnUni ? "Uni 0.05% → Uni 0.3%" : "Uni 0.3% → Uni 0.05%"
+    };
 
   } catch(e) {
     log("Check error: " + e.message);
@@ -101,18 +103,37 @@ async function checkOpportunity() {
   }
 }
 
-async function executeTrade(buyOnUniswap) {
+async function findBestOpportunity() {
+  let bestOpp = null;
+  let bestProfit = -9999;
+
+  for (const loan of LOAN_SIZES) {
+    const opp = await checkOpportunity(loan);
+    if (!opp) continue;
+
+    if (opp.profit > bestProfit) {
+      bestProfit = opp.profit;
+      bestOpp = { ...opp, loan };
+    }
+
+    // Agar bada loan acha profit de raha hai to chhota try na karo
+    if (opp.profitable && opp.profitPct > 0.05) break;
+  }
+
+  return bestOpp;
+}
+
+async function executeTrade(loan, buyOnUni) {
   try {
-    log("🚀 Executing...");
+    log("🚀 Executing flash loan $" + (Number(loan)/1e6).toFixed(0) + "...");
     const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
     const fee = await provider.getFeeData();
-    const priorityFee = fee.maxPriorityFeePerGas * 3n;
-    const maxFee = fee.maxFeePerGas * 2n;
 
-    const tx = await contract.startArbitrage(LOAN, buyOnUniswap, {
-      gasLimit: 800000,
-      maxFeePerGas: maxFee,
-      maxPriorityFeePerGas: priorityFee,
+    // 3x priority fee — MEV bots se aage!
+    const tx = await contract.startArbitrage(loan, buyOnUni, {
+      gasLimit: 900000,
+      maxFeePerGas: fee.maxFeePerGas * 2n,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas * 3n,
     });
 
     log("📤 TX: " + tx.hash);
@@ -134,18 +155,20 @@ async function executeTrade(buyOnUniswap) {
 async function scan() {
   try {
     scanCount++;
-    const opp = await checkOpportunity();
+    const opp = await findBestOpportunity();
     if (!opp) return;
 
+    const loanStr = "$" + opp.loanNum.toFixed(0);
+
     if (scanCount % 3 === 0) {
-      log(`#${scanCount} | ${opp.direction} | $${opp.profit.toFixed(4)}`);
+      log(`#${scanCount} | ${opp.direction} | Loan:${loanStr} | $${opp.profit.toFixed(4)} | ${opp.profitPct?.toFixed(4)}%`);
     }
 
     if (opp.profitable) {
-      log(`💰 PROFIT $${opp.profit.toFixed(4)}! Executing...`);
-      botStatus = `🚀 EXECUTING! ${opp.direction} | $${opp.profit.toFixed(2)}`;
+      log(`💰 PROFIT $${opp.profit.toFixed(2)} on ${loanStr} loan!`);
+      botStatus = `🚀 EXECUTING! ${loanStr} | $${opp.profit.toFixed(2)}`;
 
-      const ok = await executeTrade(opp.buyOnUniswap);
+      const ok = await executeTrade(opp.loan, opp.buyOnUni);
       if (ok) {
         totalTrades++;
         totalProfit += opp.profit;
@@ -155,7 +178,7 @@ async function scan() {
         botStatus = `❌ Failed — scanning...`;
       }
     } else {
-      botStatus = `⏸ Best: ${opp.direction} | $${opp.profit.toFixed(4)} | Need $${MIN_PROFIT}`;
+      botStatus = `⏸ Best: ${opp.direction} | ${loanStr} | $${opp.profit.toFixed(4)} | Need $${MIN_PROFIT}`;
     }
 
   } catch(e) {
@@ -195,8 +218,8 @@ h1{text-align:center;font-size:20px;margin-bottom:14px;letter-spacing:3px}
 <div class="grid">
   <div class="card"><div class="label">TOTAL PROFIT</div><div class="value">$${totalProfit.toFixed(2)}</div></div>
   <div class="card"><div class="label">TOTAL TRADES</div><div class="value">${totalTrades}</div></div>
-  <div class="card"><div class="label">LOAN</div><div class="value">$20,000</div></div>
   <div class="card"><div class="label">MIN PROFIT</div><div class="value">$${MIN_PROFIT}</div></div>
+  <div class="card"><div class="label">MEV PROTECTION</div><div class="value" style="font-size:12px">3x Gas ⚡</div></div>
   <div class="card"><div class="label">SCANS</div><div class="value">${scanCount}</div></div>
   <div class="card"><div class="label">UPTIME</div><div class="value" style="font-size:14px">${h}h ${m}m ${s}s</div></div>
 </div>
@@ -210,9 +233,9 @@ ${logs.map(l => `<div class="log-line">${l}</div>`).join("")}
 app.listen(PORT, () => {
   log("⚡ WETH/USDT ARB BOT started!");
   log("📍 Polygon Mainnet");
-  log("💰 Loan: $20,000 USDT");
+  log("💰 Smart loan: $5k-$50k auto");
   log("🎯 Min profit: $" + MIN_PROFIT);
-  log("⚡ MEV Protection: High Priority Gas 3x");
+  log("⚡ MEV Protection: 3x Priority Gas");
   log("📝 Contract: " + CONTRACT_ADDRESS);
   log("💼 Wallet: " + wallet.address);
 });
